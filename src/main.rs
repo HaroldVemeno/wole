@@ -1,25 +1,30 @@
-use std::io;
-use std::net::UdpSocket;
+use std::{collections::HashMap, env, io};
 
+use pnet::{datalink::{self, NetworkInterface}, util::MacAddr};
+use serde::{Serialize, Deserialize};
+use easy_config_store::ConfigStore;
 use clap::Parser;
 
-use pnet::datalink::{self, NetworkInterface};
-use pnet::datalink::Channel;
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::{checksum, Ipv4, Ipv4Flags, MutableIpv4Packet};
-use pnet::packet::ethernet::{EtherTypes, Ethernet, MutableEthernetPacket};
-use pnet::ipnetwork::{IpNetwork, Ipv4Network};
-use pnet::packet::Packet;
-use pnet::util::MacAddr;
+mod raw;
+mod udp;
 
-
+#[derive(Default, PartialEq, Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    aliases: HashMap<String, String>,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
 
+    // #[arg(short='4', long)]
+    // ipv4: bool,
+
+    // #[arg(short='6', long)]
+    // ipv6: bool,
+
     #[arg(short, long)]
-    save: bool,
+    save: Option<String>,
 
     #[arg(short, long)]
     raw: bool,
@@ -27,103 +32,54 @@ struct Args {
     #[arg(short, long)]
     if_name: Option<String>,
 
-    mac_string: String
+    destination: String,
+}
+
+fn get_config() -> io::Result<ConfigStore<Config>> {
+    let mut conf = if let Ok(conf_dir) = env::var("XDG_CONFIG_HOME") {
+        conf_dir.into()
+    } else if let Some(mut home) = env::home_dir() {
+        home.push(".config");
+        home
+    } else {
+        panic!("No home directory set!")
+    };
+
+    conf.push("wole.toml");
+
+     Ok(ConfigStore::<Config>::read(conf, None).expect("Couldn't read config"))
 }
 
 fn main() -> io::Result<()> {
+    let mut config = get_config()?;
     let args = Args::parse();
-    let dest_mac = args.mac_string.parse().unwrap();
-    if args.raw {
-        if let Some(if_name) = args.if_name {
-            let interface = datalink::interfaces()
-                                     .into_iter()
-                                     .filter(|ifc: &NetworkInterface| ifc.name == if_name)
-                                     .next().unwrap();
-            wol_raw(&interface, dest_mac)?;
+    let interfaces: Vec<NetworkInterface> = {
+        let ifs = datalink::interfaces().into_iter();
+        if let Some(name) = args.if_name {
+            ifs.filter(|ifc| ifc.name == name).collect()
         } else {
-            for interface in datalink::interfaces() {
-                if !interface.is_loopback()
-                  && interface.is_up()
-                  && interface.mac.is_some() {
-                    println!("Trying interface {}", interface.name);
-                    wol_raw(&interface, dest_mac)?;
-                }
-            }
+            ifs.filter(|ifc| !ifc.is_loopback() && ifc.is_up() && ifc.mac.is_some()).collect()
+        }
+    };
+    let mac: MacAddr = if let Ok(mac) = args.destination.parse::<MacAddr>() {
+        mac
+    } else if let Some(mac_str) = config.aliases.get(&args.destination) {
+        mac_str.parse::<MacAddr>().expect("Invalid mac address in config")
+    } else {
+        panic!("Unable to interpret destination");
+    };
+    if args.raw {
+        for interface in &interfaces {
+            println!("Trying interface {}", interface.name);
+            raw::send_with_interface(mac, interface)?;
         }
     } else {
-        wol_udp(dest_mac)?;
+        udp::send(mac)?;
     }
-
-    Ok(())
-}
-
-fn wol_udp(dest_mac: MacAddr) -> io::Result<()> {
-
-    let magic: Vec<MacAddr> =  [MacAddr::broadcast()].into_iter()
-                               .chain([dest_mac].into_iter().cycle().take(16)).collect();
-    let magic_data: Vec<u8> = magic.into_iter().flat_map(|mac| mac.octets()).collect();
-
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    // let sock = UdpSocket::bind("[::]:0").expect("Unable to bind");
-    sock.set_broadcast(true).expect("Unable to enable broadcast on socket");
-    sock.send_to(magic_data.as_slice(), "255.255.255.255:40000")?;
-    // sock.send_to(magic_data.as_slice(), "[ff02::1%2]:40000").expect("Unable to send packet ");
-
-    Ok(())
-}
-
-fn wol_raw(interface: &NetworkInterface, dest_mac: MacAddr) -> io::Result<()> {
-    let if_ipnet: Ipv4Network = interface.ips.iter()
-                            .filter_map(|&ipn|
-                                match ipn {
-                                    IpNetwork::V4(ip4_net) => Some(ip4_net),
-                                    _ => None
-                                }).next().unwrap();
-    let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
-        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("An error occurred when creating the datalink channel: {}", e)
-    };
-
-    let magic : Vec<MacAddr> =        [MacAddr::broadcast()].into_iter()
-                               .chain([dest_mac].into_iter().cycle().take(16)).collect();
-
-    let mut packet = Ipv4 {
-        version: 4,
-        header_length: 5,
-        dscp: 0,
-        ecn: 0,
-        total_length: 0, // will be set correctly
-        identification: 0,
-        flags: Ipv4Flags::DontFragment,
-        fragment_offset: 0,
-        ttl: 15,
-        next_level_protocol: IpNextHeaderProtocols::ZeroHop,
-        checksum: 0, // will be set correctly
-        source: if_ipnet.ip(),
-        destination: if_ipnet.broadcast(),
-        options: vec![],
-        payload: magic.into_iter().flat_map(|mac| mac.octets()).collect(),
-    };
-
-    packet.total_length = MutableIpv4Packet::packet_size(&packet) as u16;
-
-    let frame = Ethernet{
-        source: interface.mac.unwrap(),
-        destination: dest_mac,
-        ethertype: EtherTypes::WakeOnLan,
-        payload: {
-            let mut wire_packet = MutableIpv4Packet::owned(vec![0; packet.total_length as usize]).unwrap();
-            wire_packet.populate(&packet);
-            wire_packet.set_checksum(checksum(&wire_packet.to_immutable()));
-            wire_packet.packet().to_vec()
-        }
-    };
-
-    let mut wire_frame = MutableEthernetPacket::owned(vec![0; MutableEthernetPacket::packet_size(&frame)]).unwrap();
-    wire_frame.populate(&frame);
-
-    tx.send_to(wire_frame.packet(), None).unwrap()?;
+    if let Some(alias) = args.save {
+        config.aliases.insert(alias, mac.to_string());
+        config.save().expect("Couldn't write config");
+    }
 
     Ok(())
 }
