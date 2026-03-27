@@ -45,7 +45,7 @@ fn get_config() -> io::Result<ConfigStore<Config>> {
         panic!("No home directory set!")
     };
 
-    conf.push("wole.toml");
+    conf.push("wup.toml");
 
      Ok(ConfigStore::<Config>::read(conf, None).expect("Couldn't read config"))
 }
